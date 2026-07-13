@@ -328,6 +328,17 @@ add_library(radsound_psp STATIC
     ${ROOT}/src/libs/radsound/src/radsound/radicaladpcm.cpp
 )
 
+# Game render DSG classes — the real StaticEntityDSG / WorldSphereDSG render
+# objects from src/game/render/DSG (world-space static level geometry + sky
+# backdrop). WorldScene/RenderManager are NOT ported (entangled with worldsim/
+# sim/mission/camera/gameflow); the harness drives these DSG entities directly
+# with the game's render ordering (sky -> opaque -> sorted translucent).
+add_library(game_render_psp STATIC
+    ${ROOT}/src/game/memory/srrmemory_psp.cpp
+    ${ROOT}/src/game/render/DSG/IEntityDSG.cpp
+    ${ROOT}/src/game/render/DSG/StaticEntityDSG.cpp
+)
+
 #=============================================================================
 # Test EBOOT — proves Phases 2-3 LINK and runs the engine against real assets.
 #=============================================================================
@@ -349,6 +360,7 @@ target_include_directories(shartest PRIVATE
 target_link_libraries(shartest
     -Wl,--start-group
     scrooby_psp
+    game_render_psp
     pure3d_p3d_psp
     pddigu_psp
     radcontent_psp

@@ -12,6 +12,54 @@
 #ifndef SRRMEMORY_H
 #define SRRMEMORY_H
 
+#if defined(RAD_PSP)
+//=============================================================================
+// PSP: minimal subset. The game's DSG render classes only need the GMA_*
+// allocator tags + placement new. The full HeapManager / HeapStack / tracker
+// stack (and its commandlineoptions / vector / stack deps) is not ported; every
+// GMA_* allocation routes to the default heap (see memory/srrmemory_psp.cpp).
+//=============================================================================
+#include <radmemory.hpp>
+#include <stddef.h>
+
+enum GameMemoryAllocator
+{
+    GMA_DEFAULT = RADMEMORY_ALLOC_DEFAULT,
+    GMA_TEMP = RADMEMORY_ALLOC_TEMP,
+    GMA_PERSISTENT = 3,
+    GMA_LEVEL,
+    GMA_LEVEL_MOVIE,
+    GMA_LEVEL_FE,
+    GMA_LEVEL_ZONE,
+    GMA_LEVEL_OTHER,
+    GMA_LEVEL_HUD,
+    GMA_LEVEL_MISSION,
+    GMA_LEVEL_AUDIO,
+    GMA_DEBUG,
+    GMA_SPECIAL,
+    GMA_MUSIC,
+    GMA_AUDIO_PERSISTENT,
+    GMA_SMALL_ALLOC = 16,
+    GMA_CHARS_AND_GAGS = GMA_LEVEL_OTHER,
+    GMA_ANYWHERE_IN_LEVEL = 25,
+    GMA_ANYWHERE_IN_FE,
+    GMA_EITHER_OTHER_OR_ZONE,
+    GMA_ALLOCATOR_SEARCH = ALLOCATOR_SEARCH,
+    NUM_GAME_MEMORY_ALLOCATORS
+};
+
+void* operator new( size_t size, GameMemoryAllocator allocator );
+void  operator delete( void* pMemory, GameMemoryAllocator allocator );
+void* operator new[]( size_t size, GameMemoryAllocator allocator );
+void  operator delete[]( void* pMemory, GameMemoryAllocator allocator );
+
+#define MEMTRACK_PUSH_GROUP( string )
+#define MEMTRACK_POP_GROUP(  string )
+#define MEMTRACK_PUSH_FLAG( string )
+#define MEMTRACK_POP_FLAG(  string )
+
+#else   // !RAD_PSP — original full memory system
+
 //========================================
 // Nested Includes
 //========================================
@@ -275,5 +323,6 @@ HeapManager* HeapMgr ();
 
 #endif // !MEMORYTRACKER_ENABLED
 
+#endif // !RAD_PSP
 
 #endif //SRRMEMORY_H

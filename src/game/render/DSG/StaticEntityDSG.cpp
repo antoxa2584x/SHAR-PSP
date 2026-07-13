@@ -17,6 +17,9 @@
 //========================================
 #include <render/DSG/StaticEntityDSG.h>
 #include <memory/srrmemory.h>
+#if defined(RAD_PSP)
+#include <p3d/utility.hpp>   // p3d::pddi (SetZWrite) — pulled transitively elsewhere
+#endif
 
 //************************************************************************
 //

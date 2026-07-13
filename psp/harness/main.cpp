@@ -32,6 +32,15 @@ static void mlog(const char* s)
     if (f) { fputs(s, f); fputc('\n', f); fclose(f); }
 }
 
+// Breadcrumb log for the Start-New-Game world path (transition/load/render
+// steps). Gated behind PSP_DIAG_LOG like the rest (pspDiagFopen is a no-op when
+// diagnostics are off); set PSP_DIAG_LOG=1 to trace the world bring-up.
+static void wlog(const char* s)
+{
+    FILE* f = pspDiagFopen("ms0:/shar_world.log", "a");
+    if (f) { fputs(s, f); fputc('\n', f); fclose(f); }
+}
+
 // Frontend main-menu selection index (0..5), read by FePure3dObject::Render to
 // show only the selected item's glow object (mirrors the original menu). Driven
 // by the D-pad below. Default 4 = New Game (Homer glow), the retail default.
@@ -89,6 +98,7 @@ int g_pspSelectedGlow = 4;
 #include <Layer.h>
 #include <Pure3dObject.h>
 #include "FeProject.h"   // to force-clear the frontend's "loading" flag (see PH_MENU)
+#include "dsgloaders.h"  // ENTITY_DSG / WORLD_SPHERE_DSG unwrappers (level-1 world)
 #include <p3d/anim/multicontroller.hpp>
 #include <math.h>
 
@@ -224,6 +234,66 @@ static const bool kMusic = true;
 // appears). Refs held for the harness lifetime.
 static IRadSoundClipPlayer* g_scrollPlayer = NULL;
 static IRadSoundClipPlayer* g_acceptPlayer = NULL;
+
+// ---- Start New Game: load & render the Level-1 game world ---------------
+// Accepting the menu (X) mirrors the retail New Game path (guiscreenmainmenu
+// OnNewGameSelected -> GUI_MSG_QUIT_FRONTEND -> CONTEXT_LOADING_GAMEPLAY ->
+// CONTEXT_GAMEPLAY): we tear the frontend down to reclaim RAM, stream in the
+// level-1 world, and render it with a free-look camera at the player start.
+// Worldsim/physics/character control are not ported yet, so this is a
+// fly-through of the real, textured game world rather than playable gameplay.
+enum HarnessMode { HM_MENU, HM_WORLD };
+static HarnessMode g_mode = HM_MENU;
+static bool  g_worldStartRequested = false;   // set when X is pressed on the menu
+
+// Level-1 world files. L1_TERRA is the always-resident base (terrain, baked in
+// world space); l1z1 is the Simpsons'-House starting zone whose buildings/props
+// are ENTITY_DSG-wrapped meshes (unwrapped by PspEntityDSGLoader). SHAR bakes
+// static geometry in world coordinates, so every mesh draws correctly at
+// identity. Kept to two files for the ~22MB heap; append zones once we stream.
+// The Simpsons'-House region per level.mfk = "l1z1;l1r1;l1r7" + the L1_TERRA
+// base. Roads (l1r*) carry the drivable ground/road surface (as ENTITY_DSG
+// meshes); without them the foreground ground is missing (sky shows through).
+static const char* kWorldFiles[]  = { "art\\L1_TERRA.p3d", "art\\l1z1.p3d",
+                                      "art\\l1r1.p3d", "art\\l1r7.p3d" };
+static const int   kNumWorldFiles = (int)(sizeof(kWorldFiles) / sizeof(kWorldFiles[0]));
+
+// Player start = the "Simpsons' House" teleport dest from level.mfk.
+static const float WORLD_START_X = 220.0f, WORLD_START_Y = 3.5f, WORLD_START_Z = -172.0f;
+
+static int   g_worldPhase    = 0;      // 0=idle, 1=loading, 2=ready
+static int   g_worldFileIdx  = 0;
+static bool  g_worldLoaded   = false;
+static tLoadRequest* g_worldReq = NULL;
+static int   g_worldFileBaseline = 0;  // entity count when current file began
+static int   g_worldLastCount    = -1; // last observed entity count
+static int   g_worldStable       = 0;  // frames the count has held steady
+static int   g_worldFileFrames   = 0;  // frames spent on the current file (timeout)
+static tView*        g_worldView = NULL;
+static tPointCamera* g_worldCam  = NULL;
+static rmt::Vector   g_worldCamPos;
+static float         g_worldYaw  = 0.0f;
+
+// The level's real render objects, built from its DSG chunks (see dsgloaders.h)
+// and rendered with the game's ordering. g_worldEnt = static entities (the
+// StaticEntityDSG::Display + mTranslucent split the game uses); g_worldSky =
+// world-sphere/backdrop meshes drawn FIRST with depth-write off (as
+// WorldRenderLayer does — the sky is not part of the culled scene).
+static StaticEntityDSG* g_worldEnt[4096];
+static int              g_worldEntCount = 0;
+static tGeometry*       g_worldSky[64];
+static int              g_worldSkyCount = 0;
+void PspAddWorldEntity(StaticEntityDSG* dsg)
+{
+    if (g_worldEntCount < 4096) g_worldEnt[g_worldEntCount++] = dsg;
+}
+void PspAddSkyGeo(tGeometry* geo)
+{
+    if (g_worldSkyCount < 64) g_worldSky[g_worldSkyCount++] = geo;
+}
+// Ranked-translucent sort scratch (indices into g_worldEnt), sorted far->near.
+static int   g_worldTrans[4096];
+static int   g_worldTransCount = 0;
 
 // Background music streamer (streamed, not resident) + its file data source.
 static IRadSoundStreamPlayer*      g_musicStream    = NULL;
@@ -418,6 +488,7 @@ int main(int argc, char* argv[])
     { FILE* f = pspDiagFopen("ms0:/shar_fe.log",    "w"); if (f) fclose(f); }
     { FILE* f = pspDiagFopen("ms0:/shar_rm.log",    "w"); if (f) fclose(f); }
     { FILE* f = pspDiagFopen("ms0:/shar_gltex.log", "w"); if (f) fclose(f); }
+    { FILE* f = pspDiagFopen("ms0:/shar_world.log", "w"); if (f) { fputs("boot\n", f); fclose(f); } }
     mlog("boot");
 
     // Real available user memory at boot — the true heap ceiling. On a CFW PSP
@@ -648,6 +719,16 @@ int main(int argc, char* argv[])
         p3d::loadManager->AddHandler(new tBMPHandler,   "bmp");
         p3d::loadManager->AddHandler(new tTargaHandler, "tga");
 
+        // DSG unwrappers: a level zone stores its world geometry inside
+        // ENTITY_DSG / WORLD_SPHERE_DSG chunks (game-specific), each wrapping a
+        // Pure3D MESH. These handlers pull the inner tGeometry into the inventory
+        // so the world renders through the same path as any other tGeometry.
+        {
+            tGeometryLoader* dsgGeo = new tGeometryLoader;
+            p3dh->AddHandler(new PspEntityDSGLoader(dsgGeo));
+            p3dh->AddHandler(new PspWorldSphereLoader(dsgGeo));
+        }
+
         ctx->SetClearMask(PDDI_BUFFER_COLOUR | PDDI_BUFFER_DEPTH);
         ctx->SetClearDepth(1.0f);
         ctx->SetClearColour(tColour(24, 24, 40));
@@ -728,7 +809,8 @@ int main(int argc, char* argv[])
 
         // Loop the background music: once it has actually started, a drop back to
         // not-playing means the ~80s stream hit EOS, so restart it from the top.
-        if (g_musicStream)
+        // Only while in the menu — Start New Game stops the music for good.
+        if (g_musicStream && g_mode == HM_MENU)
         {
             if (g_musicStream->IsPlaying())
                 g_musicWasPlaying = true;
@@ -748,6 +830,214 @@ int main(int argc, char* argv[])
             sceKernelDelayThread(2000);
 
             Scrooby::App* app = Scrooby::App::GetInstance();
+
+            // === Start New Game -> load & render the Level-1 game world =====
+            if (g_worldStartRequested && g_mode == HM_MENU)
+            {
+                g_worldStartRequested = false;
+                g_mode = HM_WORLD;
+                mlog("world: New Game accepted -> loading level 1");
+                wlog("STEP transition-begin");
+
+                // Silence the menu audio. We do NOT tear the frontend down:
+                // Scrooby's App::UnloadProject crashes on the PSP build while
+                // freeing the frontend project's resources. Instead we just stop
+                // drawing the menu (the HM_WORLD path continues before the menu
+                // render). The world's DSG loaders build a fresh set of render
+                // objects (g_worldEnt / g_worldSky) — the resident frontend meshes
+                // are never in those lists, so nothing stray draws in the world.
+                if (g_musicStream)    g_musicStream->Stop();
+                if (g_otherGagStream) g_otherGagStream->Stop();
+                g_worldEntCount = 0; g_worldSkyCount = 0;
+                wlog("STEP audio-stopped (frontend kept resident)");
+            }
+
+            if (g_mode == HM_WORLD)
+            {
+                // --- drive the world file load sequence --------------------
+                // The load request frees itself on completion (its internal
+                // callback dumps objects into p3d::inventory then destroys the
+                // request), so polling req->GetState() is unreliable — we caught
+                // it going LOADING->freed. Instead we pump the loader and watch
+                // the inventory geometry count: when it has grown past this
+                // file's baseline and then held steady for a while, the file's
+                // objects are all dumped and we advance to the next file.
+                if (g_worldPhase == 0)
+                {
+                    wlog("STEP load-start file0");
+                    g_worldFileIdx = 0; g_worldLoaded = false; g_worldPhase = 1;
+                    g_worldFileBaseline = 0; g_worldLastCount = -1;
+                    g_worldStable = 0; g_worldFileFrames = 0;
+                    g_worldReq = startLoad(kWorldFiles[0]);
+                    mlog("world: load start");
+                    { char b[64]; sprintf(b, "STEP file0 req=%p", (void*)g_worldReq); wlog(b); }
+                }
+                else if (g_worldPhase == 1)
+                {
+                    // Pump the loader hard while the world streams (a raw request
+                    // can otherwise be starved by the single SwitchTask/frame).
+                    radFileService();
+                    p3d::loadManager->SwitchTask();
+                    radFileService();
+                    p3d::loadManager->SwitchTask();
+
+                    // The DSG loaders build render objects as chunks parse, so
+                    // watch the entity+sky count: once it has grown past this
+                    // file's baseline and held steady, the file is fully parsed.
+                    int count = g_worldEntCount + g_worldSkyCount;
+
+                    if (count == g_worldLastCount) g_worldStable++;
+                    else { g_worldStable = 0; g_worldLastCount = count; }
+                    g_worldFileFrames++;
+
+                    static int s_hb = 0;
+                    if ((s_hb++ % 30) == 0)
+                    { char b[96]; sprintf(b, "STEP hb file%d ent=%d sky=%d base=%d stable=%d fr=%d",
+                        g_worldFileIdx, g_worldEntCount, g_worldSkyCount, g_worldFileBaseline, g_worldStable, g_worldFileFrames); wlog(b); }
+
+                    // File done when new entities appeared and settled (>=45
+                    // steady frames), or a hard timeout (~1800 frames) so a file
+                    // with no renderables can't wedge the sequence.
+                    bool fileDone = (count > g_worldFileBaseline && g_worldStable >= 45)
+                                    || (g_worldFileFrames > 1800);
+                    if (fileDone)
+                    {
+                        g_worldFileIdx++;
+                        if (g_worldFileIdx < kNumWorldFiles)
+                        {
+                            { char b[64]; sprintf(b, "STEP file%d start (base=%d)", g_worldFileIdx, count); wlog(b); }
+                            g_worldFileBaseline = count;
+                            g_worldLastCount = -1; g_worldStable = 0; g_worldFileFrames = 0;
+                            g_worldReq = startLoad(kWorldFiles[g_worldFileIdx]);
+                        }
+                        else
+                        {
+                            g_worldLoaded = true; g_worldReq = NULL;
+                            mlog("world: all files loaded"); wlog("STEP all-files-loaded");
+                        }
+                    }
+                    if (g_worldLoaded)
+                    {
+                        g_worldCam = new tPointCamera; g_worldCam->AddRef();
+                        g_worldCam->SetFOV(rmt::DegToRadian(65.0f), 480.0f / 272.0f);
+                        g_worldCam->SetNearPlane(0.5f);
+                        g_worldCam->SetFarPlane(3000.0f);
+                        g_worldView = new tView; g_worldView->AddRef();
+                        g_worldView->SetCamera(g_worldCam);
+                        g_worldView->SetClearColour(tColour(96, 160, 224));   // sky
+                        g_worldView->SetClearMask(PDDI_BUFFER_COLOUR | PDDI_BUFFER_DEPTH);
+                        g_worldView->SetAmbientLight(tColour(255, 255, 255)); // no lights loaded
+                        g_worldCamPos.Set(WORLD_START_X, WORLD_START_Y + 6.0f, WORLD_START_Z);
+                        g_worldYaw = 0.0f;
+                        ctx->SetClearMask(0);   // the view owns the clear
+                        g_worldPhase = 2;
+                        {
+                            char b[64]; sprintf(b, "world: ready, %d entities %d sky", g_worldEntCount, g_worldSkyCount); mlog(b);
+                            sprintf(b, "STEP scene-ready ent=%d sky=%d", g_worldEntCount, g_worldSkyCount); wlog(b);
+                        }
+                    }
+                }
+
+                // --- render (phase 2) or a loading pulse -------------------
+                if (ctx && g_worldPhase == 2 && g_worldView)
+                {
+                    // Free-look camera: D-pad translates on the ground plane,
+                    // shoulders turn, triangle/cross raise/lower.
+                    SceCtrlData pad; sceCtrlPeekBufferPositive(&pad, 1);
+                    float mv  = deltaMs * 0.05f;     // world units / ms
+                    float rot = deltaMs * 0.0025f;   // radians / ms
+                    if (pad.Buttons & PSP_CTRL_LTRIGGER) g_worldYaw -= rot;
+                    if (pad.Buttons & PSP_CTRL_RTRIGGER) g_worldYaw += rot;
+                    float fx = rmt::Sin(g_worldYaw), fz = rmt::Cos(g_worldYaw);
+                    float rx = fz, rz = -fx;   // right = forward rotated -90
+                    if (pad.Buttons & PSP_CTRL_UP)    { g_worldCamPos.x += fx * mv; g_worldCamPos.z += fz * mv; }
+                    if (pad.Buttons & PSP_CTRL_DOWN)  { g_worldCamPos.x -= fx * mv; g_worldCamPos.z -= fz * mv; }
+                    if (pad.Buttons & PSP_CTRL_LEFT)  { g_worldCamPos.x -= rx * mv; g_worldCamPos.z -= rz * mv; }
+                    if (pad.Buttons & PSP_CTRL_RIGHT) { g_worldCamPos.x += rx * mv; g_worldCamPos.z += rz * mv; }
+                    if (pad.Buttons & PSP_CTRL_TRIANGLE) g_worldCamPos.y += mv;
+                    if (pad.Buttons & PSP_CTRL_CROSS)    g_worldCamPos.y -= mv;
+                    g_worldCam->SetPosition(g_worldCamPos);
+                    rmt::Vector tgt(g_worldCamPos.x + fx * 10.0f, g_worldCamPos.y, g_worldCamPos.z + fz * 10.0f);
+                    g_worldCam->SetTarget(tgt);
+
+                    static bool s_worldFirstDraw = true;
+                    if (s_worldFirstDraw)
+                    {
+                        wlog("STEP first-render-begin");
+                        FILE* gf = pspDiagFopen("ms0:/shar_wgeo.log", "w");
+                        if (gf)
+                        {
+                            for (int i = 0; i < g_worldEntCount; i++)
+                            {
+                                rmt::Box3D bx; g_worldEnt[i]->GetBoundingBox(&bx);
+                                const char* nm = g_worldEnt[i]->GetName();
+                                fprintf(gf, "%-26s a=%d sz=(%.0f,%.0f,%.0f) c=(%.0f,%.0f,%.0f)\n",
+                                        nm ? nm : "(null)", g_worldEnt[i]->mTranslucent ? 1 : 0,
+                                        bx.high.x-bx.low.x, bx.high.y-bx.low.y, bx.high.z-bx.low.z,
+                                        (bx.high.x+bx.low.x)*0.5f, (bx.high.y+bx.low.y)*0.5f, (bx.high.z+bx.low.z)*0.5f);
+                            }
+                            fclose(gf);
+                        }
+                    }
+
+                    // Camera ref position + view direction, for translucent SetRank.
+                    rmt::Vector camPos = g_worldCamPos;
+                    rmt::Vector camDir(fx, 0.0f, fz);
+
+                    ctx->BeginFrame();
+                    g_worldView->BeginRender();
+
+                    // Pass 0: the sky / world-sphere backdrop, drawn first with
+                    // depth-write disabled so the scene always composites over it
+                    // (mirrors WorldRenderLayer: the sphere is outside the tree).
+                    if (g_worldSkyCount > 0)
+                    {
+                        p3d::pddi->SetZWrite(false);
+                        for (int i = 0; i < g_worldSkyCount; i++)
+                            g_worldSky[i]->Display();
+                        p3d::pddi->SetZWrite(true);
+                    }
+
+                    // Pass 1: opaque static entities (real StaticEntityDSG::Display).
+                    int drawn = 0;
+                    g_worldTransCount = 0;
+                    for (int i = 0; i < g_worldEntCount; i++)
+                    {
+                        if (g_worldEnt[i]->mTranslucent)
+                        {
+                            // Rank now (distance along view) and defer to pass 2.
+                            g_worldEnt[i]->SetRank(camPos, camDir);
+                            if (g_worldTransCount < 4096) g_worldTrans[g_worldTransCount++] = i;
+                        }
+                        else { g_worldEnt[i]->Display(); drawn++; }
+                    }
+
+                    // Pass 2: translucent entities, sorted far->near (insertion
+                    // sort — the translucent set is small), so blending composites
+                    // back-to-front like WorldScene::RenderTranslucent.
+                    for (int a = 1; a < g_worldTransCount; a++)
+                    {
+                        int v = g_worldTrans[a], b = a;
+                        while (b > 0 && g_worldEnt[g_worldTrans[b - 1]]->Rank() < g_worldEnt[v]->Rank())
+                        { g_worldTrans[b] = g_worldTrans[b - 1]; b--; }
+                        g_worldTrans[b] = v;
+                    }
+                    for (int i = 0; i < g_worldTransCount; i++) { g_worldEnt[g_worldTrans[i]]->Display(); drawn++; }
+
+                    g_worldView->EndRender();
+                    ctx->EndFrame(true);
+                    if (s_worldFirstDraw)
+                    { char b[80]; sprintf(b, "STEP first-render-ok ent=%d trans=%d sky=%d", drawn, g_worldTransCount, g_worldSkyCount); wlog(b); s_worldFirstDraw = false; }
+                }
+                else if (ctx)
+                {
+                    ctx->SetClearColour(tColour(0, 0, 40 + pulse * 3));   // loading pulse
+                    ctx->BeginFrame();
+                    ctx->EndFrame(true);
+                }
+                frame++;
+                continue;
+            }
 
             // Menu navigation: D-pad up/down moves the selection (0..5, wrapping),
             // which FePure3dObject::Render uses to show only that item's glow —
@@ -781,6 +1071,11 @@ int main(int argc, char* argv[])
                     g_acceptPlayer->Play();
                 }
                 s_prevBtns = pad.Buttons;
+
+                // Accept (X) on the menu = Start New Game: request the world
+                // transition (handled next frame, before the menu logic runs).
+                if ((pressed & PSP_CTRL_CROSS) && g_mode == HM_MENU)
+                    g_worldStartRequested = true;
 
                 // Drive the label + highlight, mirroring CGuiMenu:
                 //  - SetIndex  : show the selected item's string (text changes)

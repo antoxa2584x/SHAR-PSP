@@ -17,6 +17,14 @@
 //========================================
 #ifdef WORLD_BUILDER
 #include "IEntityDSG.h"
+#elif defined(RAD_PSP)
+// PSP: the triggervolumetracker / RenderManager includes are only needed by
+// dead (commented-out) and DONT_DRAW_EXPENSIVE code below, and would drag in
+// the event/mission/worldsim web. classsizetracker is macro-only in RAD_RELEASE.
+#include <memory/classsizetracker.h>
+#include <render/DSG/IEntityDSG.h>
+#include <render/Culling/SwapArray.h>
+#include <p3d/shader.hpp>
 #else
 #include <memory/classsizetracker.h>
 #include <meta/triggervolumetracker.h>
